@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+# cyberpatriot_mint_triage.sh
+# Minimal CyberPatriot triage & safe hardening for Linux Mint (Ubuntu-based).
+# Default: audit-only (non-destructive).
+# To apply changes: sudo ./cyberpatriot_mint_triage.sh --apply --yes-i-understand
+# Run as root (sudo).
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------- CONFIG ----------
+EVIDENCE_DIR="/root/cyberpatriot_triage"
+TIMESTAMP="$(date -u +"%Y%m%dT%H%M%SZ")"
+LOGDIR="${EVIDENCE_DIR}/${TIMESTAMP}"
+NOTES="${LOGDIR}/notes.txt"
+ALLOWED_PORTS=(22 80 443)   # edit BEFORE running with --apply to match your environment
+SUSPICIOUS_PKGS=(hydra john nmap metasploit wireshark)  # simple flag list
+# ----------------------------
+
+APPLY=false
+CONFIRM=false
+
+for a in "$@"; do
+  case "$a" in
+    --apply) APPLY=true ;;
+    --yes-i-understand) CONFIRM=true ;;
+    -h|--help)
+      sed -n '1,240p' "$0"
+      exit 0
+      ;;
+    *) ;;
+  esac
+done
+
+if $APPLY && ! $CONFIRM; then
+  echo "To apply changes you must pass both --apply AND --yes-i-understand"
+  exit 1
+fi
+
+mkdir -p "${LOGDIR}"
+: > "${NOTES}"
+chmod 600 "${NOTES}"
+
+log() { printf '[%s] %s\n' "$(date -u +"%Y-%m-%d %H:%M:%SZ")" "$*" | tee -a "${NOTES}"; }
+
+log "Starting CyberPatriot triage for Linux Mint. Evidence & notes: ${LOGDIR}"
+
+# ------------------------
+# USERS
+# ------------------------
+log "USERS: saving /etc/passwd and /etc/group"
+cp /etc/passwd "${LOGDIR}/etc_passwd" 2>/dev/null || true
+cp /etc/group  "${LOGDIR}/etc_group" 2>/dev/null || true
+getent passwd > "${LOGDIR}/getent_passwd.txt"
+getent group  > "${LOGDIR}/getent_group.txt"
+awk -F: '($3>=1000 && $1!="nobody"){print $1":"$3}' /etc/passwd > "${LOGDIR}/human_users_uid.txt"
+
+log "Manual action: to reset a user password interactively: sudo passwd <username>"
+
+# ------------------------
+# SUDOERS
+# ------------------------
+log "SUDOERS: saving sudoers and /etc/sudoers.d"
+cp /etc/sudoers "${LOGDIR}/etc_sudoers" 2>/dev/null || true
+mkdir -p "${LOGDIR}/sudoers.d"
+if [ -d /etc/sudoers.d ]; then cp -a /etc/sudoers.d/* "${LOGDIR}/sudoers.d/" 2>/dev/null || true; fi
+
+# ------------------------
+# GUEST / AUTOLOGIN
+# ------------------------
+log "GUEST/AUTOLOGIN: detecting autologin and guest-like accounts"
+grep -R --line-number "autologin" /etc 2>/dev/null | tee "${LOGDIR}/autologin_matches.txt" || true
+awk -F: '/guest|autologin/ {print $0}' /etc/passwd | tee "${LOGDIR}/guest_like_accounts.txt" || true
+
+disable_autologin() {
+  log "Attempting to disable autologin (LightDM/GDM checks)."
+  if [ -f /etc/lightdm/lightdm.conf ]; then
+    sed -ri 's/^\s*autologin-user=.*$/#autologin-user=disabled/' /etc/lightdm/lightdm.conf 2>/dev/null || true
+    log "LightDM: commented autologin entries (if any)."
+  fi
+  # check GDM
+  if [ -d /etc/gdm3 ]; then
+    grep -R --line-number "AutomaticLogin" /etc/gdm3 2>/dev/null | tee "${LOGDIR}/gdm_autologin_matches.txt" || true
+    log "GDM: matches saved for manual review."
+  fi
+}
+
+# ------------------------
+# BACKGROUND TASKS (update + unattended)
+# ------------------------
+log "BACKGROUND TASKS: running apt update (audit-only) and listing upgrade actions"
+apt-get update -y >> "${LOGDIR}/apt_update_output.txt" 2>&1 || true
+apt-get --just-print upgrade >> "${LOGDIR}/apt_upgrade_dryrun.txt" 2>&1 || true
+dpkg -l | head -n 300 > "${LOGDIR}/dpkg_head.txt"
+
+enable_unattended() {
+  log "Enabling unattended-upgrades (installing if missing) and configuring minimal auto-updates."
+  if ! dpkg -l | grep -qw unattended-upgrades; then
+    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y unattended-upgrades
+  fi
+  cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+  log "Unattended-upgrades configured."
+}
+
+# ------------------------
+# SERVICES & PROCESSES
+# ------------------------
+log "SERVICES & PROCESSES: saving running services and process list"
+systemctl list-units --type=service --state=running > "${LOGDIR}/running_services.txt" 2>/dev/null || true
+ps aux --sort=-%cpu | head -n 200 > "${LOGDIR}/ps_top200.txt"
+ss -tunap > "${LOGDIR}/ss_listening.txt" 2>/dev/null || true
+
+log "Review cron jobs (system & users) and flag any using curl/wget"
+crontab -l > "${LOGDIR}/crontab_root.txt" 2>/dev/null || true
+ls -la /etc/cron* > "${LOGDIR}/cron_dirs_listing.txt" 2>/dev/null || true
+grep -R --line-number -E "curl|wget|bash -c" /etc/cron* /var/spool/cron* 2>/dev/null | tee "${LOGDIR}/cron_sus_lines.txt" || true
+
+stop_disable_service() {
+  svc="$1"
+  log "Stopping & disabling service: ${svc}"
+  systemctl stop "${svc}" || true
+  systemctl disable "${svc}" || true
+  systemctl status "${svc}" --no-pager > "${LOGDIR}/svc_${svc}_status_after.txt" 2>/dev/null || true
+}
+
+# ------------------------
+# LOCAL SECURITY POLICIES (PAM/login.defs)
+# ------------------------
+log "LOCAL SECURITY POLICIES: saving login.defs and PAM password file"
+cp /etc/login.defs "${LOGDIR}/login.defs" 2>/dev/null || true
+if [ -f /etc/pam.d/common-password ]; then cp /etc/pam.d/common-password "${LOGDIR}/common-password" 2>/dev/null || true; fi
+
+enforce_password_policy() {
+  log "Applying minimal password rules: min length 8, basic pam_pwquality minlen (attempt)."
+  sed -ri 's/^\s*PASS_MIN_LEN\s+.*/PASS_MIN_LEN\t8/' /etc/login.defs 2>/dev/null || echo -e "PASS_MIN_LEN\t8" >> /etc/login.defs
+  # Attempt to ensure pam_pwquality minlen=8 in common-password
+  if [ -f /etc/pam.d/common-password ]; then
+    if ! grep -q "pam_pwquality.so" /etc/pam.d/common-password; then
+      sed -ri 's/(password\s+requisite\s+pam_unix.so.*)/\1/' /etc/pam.d/common-password 2>/dev/null || true
+      echo "password requisite pam_pwquality.so retry=3 minlen=8" >> /etc/pam.d/common-password
+    else
+      sed -ri 's/(pam_pwquality.so[^\\n]*)(minlen=\d+)/\1minlen=8/' /etc/pam.d/common-password 2>/dev/null || true
+    fi
+    cp /etc/pam.d/common-password "${LOGDIR}/common-password.after" 2>/dev/null || true
+  fi
+  log "Password policy changes saved (manual review recommended)."
+}
+
+# Disable root SSH login helpers
+cp /etc/ssh/sshd_config "${LOGDIR}/sshd_config" 2>/dev/null || true
+disable_root_ssh() {
+  log "Disabling root SSH login (PermitRootLogin no) and reloading sshd."
+  cp /etc/ssh/sshd_config "${LOGDIR}/sshd_config.pre_change" 2>/dev/null || true
+  if grep -qEi "^\s*PermitRootLogin" /etc/ssh/sshd_config; then
+    sed -ri 's/^\s*#?\s*PermitRootLogin\s+.*/PermitRootLogin no/' /etc/ssh/sshd_config
+  else
+    echo "PermitRootLogin no" >> /etc/ssh/sshd_config
+  fi
+  systemctl reload sshd || systemctl reload ssh || true
+  log "sshd reloaded (if present). Ensure at least one admin user can still SSH."
+}
+
+# ------------------------
+# FIREWALL & PORTS
+# ------------------------
+log "FIREWALL: checking UFW and listening ports"
+if command -v ufw >/dev/null 2>&1; then
+  ufw status verbose > "${LOGDIR}/ufw_status.txt" 2>/dev/null || true
+else
+  echo "ufw-not-installed" > "${LOGDIR}/ufw_status.txt"
+fi
+ss -tunlp > "${LOGDIR}/listening_ports.txt" 2>/dev/null || true
+
+enable_firewall() {
+  log "Enabling UFW and allowing only: ${ALLOWED_PORTS[*]} (edit allowed ports in the script first)"
+  if ! command -v ufw >/dev/null 2>&1; then
+    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y ufw
+  fi
+  ufw default deny incoming
+  ufw default allow outgoing
+  for p in "${ALLOWED_PORTS[@]}"; do ufw allow "$p"; done
+  ufw --force enable
+  ufw status verbose > "${LOGDIR}/ufw_status_after.txt"
+  log "UFW enabled. Confirm SSH access from admin IPs to avoid lockout."
+}
+
+# ------------------------
+# SOFTWARE & PACKAGES
+# ------------------------
+log "SOFTWARE & PACKAGES: listing installed packages (dpkg) and flagging common offensive tools"
+dpkg -l > "${LOGDIR}/dpkg_list.txt" 2>/dev/null || true
+> "${LOGDIR}/flagged_packages.txt"
+for pk in "${SUSPICIOUS_PKGS[@]}"; do
+  if dpkg -l 2>/dev/null | grep -iq "$pk"; then
+    echo "$pk" >> "${LOGDIR}/flagged_packages.txt"
+  fi
+done
+if [ -s "${LOGDIR}/flagged_packages.txt" ]; then
+  log "Flagged packages saved: ${LOGDIR}/flagged_packages.txt"
+else
+  rm -f "${LOGDIR}/flagged_packages.txt"
+  log "No suspicious packages from quick list found."
+fi
+
+remove_package() {
+  pkg="$1"
+  log "Removing package: ${pkg}"
+  apt-get remove --purge -y "${pkg}" || true
+  apt-get autoremove -y || true
+  log "Removal attempted for ${pkg}."
+}
+
+# ------------------------
+# FILE PERMISSIONS & SHARES
+# ------------------------
+log "FILES & SHARES: checking home permissions and shares (Samba/NFS)"
+getfacl -R /home 2>/dev/null | head -n 200 > "${LOGDIR}/home_getfacl_head.txt" || true
+if systemctl list-unit-files | grep -qE "smb|nfs"; then
+  systemctl status smbd nmbd nfs-server 2>/dev/null > "${LOGDIR}/share_services_status.txt" || true
+fi
+
+disable_samba_nfs() {
+  log "Stopping & disabling Samba/NFS services if present"
+  for svc in smbd nmbd nfs-server; do
+    if systemctl list-unit-files | grep -q "${svc}"; then
+      systemctl stop "${svc}" || true
+      systemctl disable "${svc}" || true
+      log "Stopped/disabled ${svc}"
+    fi
+  done
+}
+
+# ------------------------
+# LOGGING & AUDIT
+# ------------------------
+log "LOGGING: collecting auth logs and checking auditd"
+if [ -f /var/log/auth.log ]; then
+  tail -n 2000 /var/log/auth.log > "${LOGDIR}/auth_log_tail.txt" 2>/dev/null || true
+elif [ -f /var/log/secure ]; then
+  tail -n 2000 /var/log/secure > "${LOGDIR}/secure_log_tail.txt" 2>/dev/null || true
+fi
+if command -v auditctl >/dev/null 2>&1; then auditctl -s > "${LOGDIR}/auditctl_status.txt" 2>/dev/null || true; else echo "auditd-not-installed" > "${LOGDIR}/auditd_status.txt"; fi
+
+enable_auditd() {
+  log "Installing/enabling auditd"
+  if ! dpkg -l | grep -qw auditd; then
+    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y auditd audispd-plugins
+  fi
+  systemctl enable auditd || true
+  systemctl start auditd || true
+  auditctl -s > "${LOGDIR}/auditctl_status_after.txt" 2>/dev/null || true
+  log "auditd enabled and started."
+}
+
+# ------------------------
+# MISC: SEARCH NON-WORK FILES & BACKUPS
+# ------------------------
+log "MISC: searching for non-work media under /home (*.mp3, *.mp4)"
+find /home -type f \( -iname '*.mp3' -o -iname '*.mp4' \) -print 2>/dev/null | tee "${LOGDIR}/home_media_files.txt" || true
+
+log "Checking /etc for common backup tool mentions"
+grep -R --line-number -E "rsnapshot|duplicity|borg|restic|backup" /etc 2>/dev/null | tee "${LOGDIR}/backup_configs.txt" || true
+
+# ------------------------
+# BROWSER HARDENING (instructions only)
+# ------------------------
+cat >> "${NOTES}" <<'EOF'
+
+--- Browser Hardening (manual steps) ---
+* Remove cookies & site data (Browser Settings > Privacy > Clear Data).
+* Disable JavaScript if required (NoScript extension in Firefox).
+* Block third-party cookies / trackers.
+* Disable Google account sync and Google services in browser settings.
+* Use HTTPS-only mode and keep browser up-to-date.
+* Set Firefox as default: xdg-settings set default-web-browser firefox.desktop
+-------------------------------------
+EOF
+
+# ------------------------
+# APPLY MODE: make changes (only if explicit)
+# ------------------------
+if $APPLY; then
+  log "APPLY MODE: making changes (explicit consent provided). Proceeding carefully."
+
+  # Full upgrade
+  log "Running apt-get upgrade (non-interactive)."
+  apt-get update && DEBIAN_FRONTEND=noninteractive apt-get -y upgrade
+
+  # Enable unattended
+  enable_unattended
+
+  # Enforce password policy
+  enforce_password_policy
+
+  # Disable root ssh (only config edits)
+  disable_root_ssh
+
+  # Enable firewall
+  enable_firewall
+
+  # Disable samba/nfs if present
+  disable_samba_nfs
+
+  # Enable auditd
+  enable_auditd
+
+  log "APPLY actions finished. Double-check service access (SSH/web) to avoid lockout."
+else
+  log "No changes applied. Audit-only run. To change system, re-run with --apply --yes-i-understand"
+fi
+
+log "Triage complete. Secure the evidence folder: ${LOGDIR}"
+echo "DONE - notes: ${NOTES}"
