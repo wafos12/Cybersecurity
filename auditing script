@@ -1,73 +1,81 @@
 #!/bin/bash
-# CyberPatriot Linux Audit Script
-# Run as root: sudo ./cp_audit.sh
+# CyberPatriot Linux Auto-Audit & Cleanup Script
+# Run as root: sudo ./cp_auto_cleanup.sh
 
-echo "===================="
-echo "  CyberPatriot Linux Audit"
-echo "===================="
-echo ""
+LOGFILE="/tmp/cp_cleanup_$(date +%Y%m%d_%H%M%S).log"
+echo "CyberPatriot Auto-Cleanup Log - $(date)" > $LOGFILE
+echo "====================" >> $LOGFILE
 
-# 1. Users and Groups
-echo "[*] Checking users with empty passwords..."
-awk -F: '($2==""){print $1}' /etc/shadow
+# Function to log both console and logfile
+log() {
+    echo "$1"
+    echo "$1" >> $LOGFILE
+}
 
-echo ""
-echo "[*] Checking sudo users..."
-getent group sudo
+log "[*] Starting CyberPatriot Linux auto-audit & cleanup"
 
-echo ""
-echo "[*] Listing all users..."
-cut -d: -f1 /etc/passwd
+# 1. Users with empty passwords
+log "[*] Users with empty passwords:"
+awk -F: '($2==""){print $1}' /etc/shadow | tee -a $LOGFILE
 
-# 2. Services
-echo ""
-echo "[*] Active services:"
-systemctl list-units --type=service --state=running
+# 2. Sudo users
+log "[*] Sudo users:"
+getent group sudo | tee -a $LOGFILE
 
-echo ""
-echo "[*] Listening TCP/UDP ports:"
-ss -tuln
+# 3. Active services
+log "[*] Active services:"
+systemctl list-units --type=service --state=running | tee -a $LOGFILE
 
-# 3. Installed packages (optional: show risky ones)
-echo ""
-echo "[*] Peer-to-peer and risky packages installed:"
-dpkg -l | grep -E 'amule|transmission|vuze|qbittorrent|deluge|nicotine|ktorrent|frostwire|wireshark|apache2|nginx|telnet|rsh|sendmail|exim|postfix|mysql|postgresql'
+# 4. Listening TCP/UDP ports
+log "[*] Listening TCP/UDP ports:"
+ss -tuln | tee -a $LOGFILE
 
-echo ""
-echo "[*] Leftover config files (rc packages):"
-dpkg -l | grep '^rc'
+# 5. Risky/unnecessary packages
+RISKY_PACKAGES=$(dpkg -l | grep -E 'amule|transmission|vuze|qbittorrent|deluge|nicotine|ktorrent|frostwire|wireshark|apache2|nginx|telnet|rsh|sendmail|exim|postfix|mysql|postgresql' | awk '{print $2}')
 
-# 4. File permissions
-echo ""
-echo "[*] World-writable files:"
-find / -type f -perm -o+w 2>/dev/null
+if [ ! -z "$RISKY_PACKAGES" ]; then
+    log "[*] Removing risky packages:"
+    for pkg in $RISKY_PACKAGES; do
+        log "Purging $pkg"
+        apt purge -y $pkg >> $LOGFILE 2>&1
+    done
+    # Auto-remove dependencies
+    apt autoremove -y >> $LOGFILE 2>&1
+else
+    log "[*] No risky packages found."
+fi
 
-echo ""
-echo "[*] SUID/SGID files:"
-find / -type f \( -perm -4000 -o -perm -2000 \) 2>/dev/null
+# 6. Leftover config files (rc)
+RC_PACKAGES=$(dpkg -l | grep '^rc' | awk '{print $2}')
+if [ ! -z "$RC_PACKAGES" ]; then
+    log "[*] Purging leftover config files:"
+    dpkg --purge $RC_PACKAGES >> $LOGFILE 2>&1
+else
+    log "[*] No leftover config files."
+fi
 
-echo ""
-echo "[*] Home directories permissions:"
-ls -ld /home/*
+# 7. File permissions
+log "[*] World-writable files:"
+find / -type f -perm -o+w 2>/dev/null | tee -a $LOGFILE
 
-# 5. Firewall
-echo ""
-echo "[*] Firewall status (ufw):"
-ufw status verbose
+log "[*] SUID/SGID files:"
+find / -type f \( -perm -4000 -o -perm -2000 \) 2>/dev/null | tee -a $LOGFILE
 
-# 6. Password policies
-echo ""
-echo "[*] Password expiration for all users:"
+# 8. Firewall status
+log "[*] Firewall status (ufw):"
+ufw status verbose | tee -a $LOGFILE
+
+# 9. Password expiration
+log "[*] Password expiration for all users:"
 for user in $(cut -f1 -d: /etc/passwd); do
-    echo "User: $user"
-    chage -l $user
+    log "User: $user"
+    chage -l $user | tee -a $LOGFILE
 done
 
-# 7. Logs
-echo ""
-echo "[*] Last 50 authentication log entries:"
-tail -n 50 /var/log/auth.log
+# 10. Authentication logs
+log "[*] Last 50 authentication log entries:"
+tail -n 50 /var/log/auth.log | tee -a $LOGFILE
 
-echo ""
-echo "===================="
-echo "Audit complete."
+log "[*] CyberPatriot auto-audit & cleanup complete."
+log "[*] Log saved at $LOGFILE"
+
