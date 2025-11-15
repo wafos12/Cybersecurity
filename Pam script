@@ -13,7 +13,7 @@ cp -r /etc/pam.d/* /root/pam_backup/
 
 # Enforce password complexity using pam_pwquality
 echo "[*] Updating /etc/security/pwquality.conf"
-cat <<EOL >/etc/security/pwquality.conf
+cat << 'EOL' >/etc/security/pwquality.conf
 minlen = 12
 dcredit = -1
 ucredit = -1
@@ -24,10 +24,10 @@ EOL
 
 # Configure password policies in common-password
 echo "[*] Updating /etc/pam.d/common-password"
-sed -i '/pam_unix.so/ s/$/ remember=5 minlen=12/' /etc/pam.d/common-password
 if ! grep -q "pam_pwquality.so" /etc/pam.d/common-password; then
     sed -i '/pam_unix.so/ i\password requisite pam_pwquality.so retry=3' /etc/pam.d/common-password
 fi
+sed -i '/pam_unix.so/ s/$/ remember=5 minlen=12/' /etc/pam.d/common-password
 
 # Lock account after 3 failed login attempts using pam_tally2
 echo "[*] Updating /etc/pam.d/common-auth for login attempts"
@@ -35,11 +35,23 @@ if ! grep -q "pam_tally2.so" /etc/pam.d/common-auth; then
     sed -i '/pam_unix.so/ i\auth required pam_tally2.so deny=3 unlock_time=900 onerr=fail audit' /etc/pam.d/common-auth
 fi
 
-# Force password change on next login for all users with empty passwords
+# Force password change on next login for users with empty passwords
 echo "[*] Forcing password change for users with empty passwords"
 awk -F: '($2==""){print $1}' /etc/shadow | while read user; do
     passwd -e "$user"
 done
 
 # Prevent root login via SSH (if applicable)
-echo "[*] Updating /etc/ssh/ssh*]()
+echo "[*] Updating /etc/ssh/sshd_config to disable root login"
+if grep -q "^PermitRootLogin" /etc/ssh/sshd_config; then
+    sed -i 's/^PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+else
+    echo "PermitRootLogin no" >> /etc/ssh/sshd_config
+fi
+
+# Reload SSH to apply changes
+echo "[*] Reloading SSH..."
+systemctl reload sshd || echo "[!] SSH reload failed; ensure SSH restart manually"
+
+echo "[*] PAM hardening complete!"
+echo "[*] Backup of original configs is in /root/pam_backup"
