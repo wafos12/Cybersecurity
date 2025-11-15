@@ -1,10 +1,13 @@
 #!/bin/bash
-# PAM Hardening Script
-# Run as root: sudo ./pam_hardening.sh
+# PAM Hardening Script (Safe for Admin)
+# Run as root: sudo ./pam_hardening_safe.sh
 
 set -e
 
-echo "[*] Starting PAM hardening..."
+# Set your admin username to skip
+ADMIN_USER="benjamin"
+
+echo "[*] Starting PAM hardening (excluding $ADMIN_USER)..."
 
 # Backup PAM configs first
 echo "[*] Backing up PAM configuration..."
@@ -35,9 +38,9 @@ if ! grep -q "pam_tally2.so" /etc/pam.d/common-auth; then
     sed -i '/pam_unix.so/ i\auth required pam_tally2.so deny=3 unlock_time=900 onerr=fail audit' /etc/pam.d/common-auth
 fi
 
-# Force password change on next login for users with empty passwords
-echo "[*] Forcing password change for users with empty passwords"
-awk -F: '($2==""){print $1}' /etc/shadow | while read user; do
+# Force password change for users with empty passwords EXCEPT admin
+echo "[*] Forcing password change for users with empty passwords (excluding $ADMIN_USER)"
+awk -F: -v skip="$ADMIN_USER" '($2==""){if($1 != skip) print $1}' /etc/shadow | while read user; do
     passwd -e "$user"
 done
 
@@ -51,7 +54,7 @@ fi
 
 # Reload SSH to apply changes
 echo "[*] Reloading SSH..."
-systemctl reload sshd || echo "[!] SSH reload failed; ensure SSH restart manually"
+systemctl reload sshd || echo "[!] SSH reload failed; restart manually if needed"
 
 echo "[*] PAM hardening complete!"
 echo "[*] Backup of original configs is in /root/pam_backup"
