@@ -1,41 +1,45 @@
 #!/bin/bash
-# CyberPatriot PAM Hardening Script
+# PAM Hardening Script
 # Run as root: sudo ./pam_hardening.sh
 
-echo "===================="
-echo "  PAM Hardening Script"
-echo "===================="
+set -e
 
-# Backup current PAM configs
-echo "[*] Backing up PAM configs..."
+echo "[*] Starting PAM hardening..."
+
+# Backup PAM configs first
+echo "[*] Backing up PAM configuration..."
 mkdir -p /root/pam_backup
-cp /etc/pam.d/common-auth /root/pam_backup/
-cp /etc/pam.d/common-password /root/pam_backup/
-cp /etc/pam.d/sshd /root/pam_backup/
-echo "[*] Backup complete at /root/pam_backup/"
+cp -r /etc/pam.d/* /root/pam_backup/
 
-# 1. Enforce strong passwords (common-password)
-echo "[*] Configuring strong password policy..."
-sed -i '/pam_unix.so/ s/$/ minlen=12 ucredit=-1 lcredit=-1 dcredit=-1 ocredit=-1/' /etc/pam.d/common-password
-echo "[*] Strong password policy applied (min 12 chars, must include upper, lower, digit, special)."
+# Enforce password complexity using pam_pwquality
+echo "[*] Updating /etc/security/pwquality.conf"
+cat <<EOL >/etc/security/pwquality.conf
+minlen = 12
+dcredit = -1
+ucredit = -1
+ocredit = -1
+lcredit = -1
+enforce_for_root
+EOL
 
-# 2. Force password change on first login (example for user 'student')
-echo "[*] Forcing password change on first login..."
-chage -d 0 student
+# Configure password policies in common-password
+echo "[*] Updating /etc/pam.d/common-password"
+sed -i '/pam_unix.so/ s/$/ remember=5 minlen=12/' /etc/pam.d/common-password
+if ! grep -q "pam_pwquality.so" /etc/pam.d/common-password; then
+    sed -i '/pam_unix.so/ i\password requisite pam_pwquality.so retry=3' /etc/pam.d/common-password
+fi
 
-# 3. Account lockout after 3 failed attempts (common-auth)
-echo "[*] Configuring account lockout..."
+# Lock account after 3 failed login attempts using pam_tally2
+echo "[*] Updating /etc/pam.d/common-auth for login attempts"
 if ! grep -q "pam_tally2.so" /etc/pam.d/common-auth; then
-    sed -i '/pam_unix.so/ i auth required pam_tally2.so onerr=fail deny=3 unlock_time=900' /etc/pam.d/common-auth
+    sed -i '/pam_unix.so/ i\auth required pam_tally2.so deny=3 unlock_time=900 onerr=fail audit' /etc/pam.d/common-auth
 fi
-echo "[*] Lockout policy applied (3 failed attempts, 15 min lock)."
 
-# 4. Disable root login via SSH
-echo "[*] Disabling root login via SSH..."
-if ! grep -q "^PermitRootLogin no" /etc/ssh/sshd_config; then
-    sed -i 's/^#PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
-    systemctl restart ssh
-fi
-echo "[*] Root login disabled."
+# Force password change on next login for all users with empty passwords
+echo "[*] Forcing password change for users with empty passwords"
+awk -F: '($2==""){print $1}' /etc/shadow | while read user; do
+    passwd -e "$user"
+done
 
-echo "[*] PAM hardening complete."
+# Prevent root login via SSH (if applicable)
+echo "[*] Updating /etc/ssh/ssh*]()
